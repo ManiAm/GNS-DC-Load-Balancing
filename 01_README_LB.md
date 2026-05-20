@@ -9,7 +9,7 @@ This full-mesh wiring creates **multiple equal-cost paths** between any two serv
 
 That decision is the core of **fabric load balancing**, and it involves two distinct systems working together: the control plane discovers the available paths, and the switching ASIC (NPU) makes the actual per-packet forwarding decision in hardware.
 
-> For a comprehensive treatment of data center topologies (Leaf-Spine, Fat-Tree, Dragonfly, and more), physical wiring models, and scaling strategies, see the [Network Topology](https://github.com/ManiAm/GNS-DC-VXLAN/blob/master/docs/03_README_TOPOLOGY.md) document in the DC-VXLAN project.
+> For a comprehensive treatment of data center topologies (Leaf-Spine, Fat-Tree, Dragonfly, and more), physical wiring models, and scaling strategies, see the [Network Topology](https://github.com/ManiAm/DC-Fundamentals/blob/master/docs/03_README_TOPOLOGY.md) document in the DC-Fundamentals project.
 
 
 ## Path Discovery (Control Plane)
