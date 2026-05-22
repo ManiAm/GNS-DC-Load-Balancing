@@ -46,13 +46,25 @@ Standard ECMP is a purely static mechanism. It assigns a flow to a path at conne
 This is the fundamental mismatch: ECMP was designed for a world of many small, statistically diverse flows. RoCEv2 AI traffic produces a small number of massive, long-lived flows where the statistical assumptions collapse.
 
 
-### QP Scaling: The Software Workaround
+### QP Scaling (MQP): The Software Workaround
 
-The most common software-level approach to improving RoCEv2 load balancing is **QP scaling**. Instead of sending a transfer over a single QP, the application (or collective communication library such as NCCL) splits the data across multiple QPs to the same destination. Because each QP generates a different UDP source port, ECMP hashes them to different spine links, distributing the load.
+The most common software-level approach to improving RoCEv2 load balancing is **QP scaling**, also known as **Multiple Queue Pairs (MQP)**. The core idea is simple: instead of sending a transfer over a single QP, the application (or collective communication library such as NCCL) opens multiple QPs to the same destination. Each QP is assigned a different UDP source port, so ECMP treats each one as a separate flow and hashes them independently across different spine links — turning one elephant flow into several smaller, well-distributed flows.
 
-For example, if a single 400 Gb/s transfer is split across 4 QPs, each QP carries approximately 100 Gb/s and hashes independently. The probability that all four collide on the same link drops significantly compared to a single QP.
+For example, if a single 400 Gb/s transfer is split across 4 QPs, each QP carries approximately 100 Gb/s. Because ECMP hashes each QP independently, the probability that all four collide on the same link drops significantly compared to a single QP.
 
-Meta deployed QP scaling across their production AI training clusters and measured its impact on AllReduce bandwidth. The figure below (from [Meta's SIGCOMM 2024 paper](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)) compares two strategies — splitting each message across multiple QPs versus posting successive messages to different QPs in round-robin fashion — at QP counts of 1, 4, and 16. Round-robin with 16 QPs achieves near-100% normalized bandwidth for large messages (2 GB), while a single QP (the "out of box" baseline) reaches only ~60%. The improvement is most pronounced for large messages where elephant flows dominate; for small messages (2–8 MB), even 16 QPs provide limited benefit because the transfers are too short to create sustained congestion.
+There are two common MQP strategies:
+
+| Strategy        | How it works | Best for |
+|-----------------|-------------|----------|
+| **Split**       | A single large message is divided across multiple QPs simultaneously | Latency-sensitive large transfers |
+| **Round-robin** | Successive messages are posted to different QPs in rotation | Sustained throughput workloads |
+
+Meta deployed QP scaling across their production AI training clusters and measured its impact on AllReduce bandwidth. The figure below (from [Meta's SIGCOMM 2024 paper](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)) compares these two strategies at QP counts of 1, 4, and 16. Key findings:
+
+- **Round-robin with 16 QPs** achieves near-100% normalized bandwidth for large messages (2 GB).
+- **Single QP** (the "out of box" baseline) reaches only ~60%.
+
+The improvement is most pronounced for large messages where elephant flows dominate; for small messages (2–8 MB), even 16 QPs provide limited benefit because the transfers are too short to create sustained congestion.
 
 <img src="./pics/qp-scaling-meta.png" width="550"/>
 
@@ -94,6 +106,76 @@ However, reorder buffers have a fundamental limitation: they are **finite**. The
 **Approach 2: True out-of-order placement (eliminate reordering entirely)**
 
 Rather than buffering and reassembling, [MRC](#mrc-multipath-reliable-connection) makes every packet self-describing — each carries the full RDMA virtual address, so the receiving NIC writes it directly to the correct memory position on arrival, regardless of order. No reorder buffer is needed, no packet is dropped for arriving early, and path diversity is no longer constrained by buffer size.
+
+
+
+## Measuring Load Balance: Coefficient of Variation (CoV)
+
+The preceding sections describe several load balancing strategies — static ECMP, MQP, flowlet switching, and packet spraying — each offering progressively better traffic distribution. But how do we *quantify* "better"? Saying one approach is "more balanced" than another is meaningless without a metric. The industry-standard metric for this is the **Coefficient of Variation (CoV)** of per-link load.
+
+### What Is CoV?
+
+CoV is the ratio of the standard deviation to the mean of a set of measurements:
+
+```
+CoV = σ / μ
+```
+
+Where:
+- **σ** (standard deviation) measures how much individual link loads deviate from the average.
+- **μ** (mean) is the average load across all links.
+
+The result is a dimensionless number that captures how *uniformly* traffic is spread across available paths, regardless of total traffic volume or the number of links.
+
+### Interpreting CoV
+
+- **CoV = 0**: Every link carries exactly the same load. Perfect balance.
+- **CoV > 0**: Some links carry more traffic than others. The higher the value, the worse the imbalance.
+
+Because CoV is normalized by the mean, it allows fair comparison across different fabric sizes and traffic volumes. A CoV of 0.25 means the same thing whether you have 4 spine links or 64 — roughly 25% variation around the average load.
+
+### Why CoV Matters for AI Training
+
+Consider a Leaf-Spine fabric with 8 spine links, each rated at 400 Gb/s (3,200 Gb/s aggregate bisection bandwidth). If traffic is perfectly balanced (CoV = 0), every link carries 400 Gb/s and the fabric delivers full bisection bandwidth. But if traffic is skewed (CoV > 0), some links saturate while others sit idle:
+
+```
+Example: 8 spine links, 2,400 Gb/s total traffic, CoV = 0.25
+
+  Mean load per link:  μ = 2400 / 8 = 300 Gb/s
+  Standard deviation:  σ = CoV × μ = 0.25 × 300 = 75 Gb/s
+
+  Hottest links:       300 + 75 = 375 Gb/s  (near saturation at 400 Gb/s)
+  Coldest links:       300 - 75 = 225 Gb/s  (significant spare capacity)
+```
+
+The fabric has 800 Gb/s of unused capacity (on the cold links), yet the hot links are approaching congestion. One more flow hashing to a hot link triggers packet drops, PFC pauses, or ECN marking — even though aggregate utilization is only 75%. With perfect balance, the fabric could absorb 33% more traffic before any link hits capacity.
+
+This is why CoV directly translates to **effective fabric throughput** for AI collectives. AllReduce, AllGather, and AllToAll are *synchronized* — the collective completes at the speed of the *slowest* transfer. A single overloaded link (caused by hash collision) bottlenecks the entire operation across all GPUs, while the underloaded links waste capacity that cannot be reclaimed.
+
+### CoV by Load Balancing Strategy
+
+The following table summarizes typical CoV values for each approach discussed in this document, measured on production-scale Leaf-Spine fabrics under AI training workloads:
+
+| Strategy                      | Typical CoV | Why |
+|-------------------------------|-------------|-----|
+| **Static ECMP (single QP)**   | ≈ 0.25      | One hash per flow → elephant flows pile on random links |
+| **Flowlet switching**         | ≈ 0.10      | Reroutes during idle gaps, but continuous streams still pin |
+| **MQP (16 QPs)**              | ≈ 0.07      | More flows improve statistical distribution, but collisions remain |
+| **Packet spraying**           | ≈ 0.03      | Per-packet distribution, near-ideal but limited by reorder buffers |
+| **SRv6 source routing (MRC)** | ≤ 0.02      | Deterministic path selection across all planes, no hash collisions |
+
+The progression is clear: each strategy reduces CoV by attacking a different source of imbalance. Static ECMP suffers from hash collisions and flow pinning. MQP reduces the impact of individual collisions by creating more flows. Flowlet and packet spraying introduce dynamic path selection. MRC with SRv6 eliminates hash-based randomness entirely, achieving near-zero CoV by deterministically distributing packets across all available paths.
+
+### CoV as a Design Target
+
+In practice, network architects use CoV thresholds to guide design decisions:
+
+- **CoV > 0.20**: Unacceptable for large-scale AI training. Frequent hotspots cause PFC storms or packet loss. Requires intervention (MQP at minimum).
+- **CoV 0.10–0.20**: Tolerable for smaller clusters or less bandwidth-intensive workloads. Flowlet switching typically achieves this range.
+- **CoV 0.05–0.10**: Good. MQP with sufficient QP count, or flowlet with cooperative traffic patterns.
+- **CoV < 0.05**: Excellent. Requires per-packet load balancing (spraying or MRC). The fabric operates near its theoretical maximum throughput.
+
+These thresholds explain why the industry has progressively moved from ECMP toward packet-level load balancing for AI workloads — the performance cost of imbalance is too high when thousands of GPUs synchronize on every collective operation.
 
 
 
