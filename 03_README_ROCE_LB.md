@@ -111,7 +111,7 @@ Rather than buffering and reassembling, [MRC](#mrc-multipath-reliable-connection
 
 ## Measuring Load Balance: Coefficient of Variation (CoV)
 
-The preceding sections describe several load balancing strategies — static ECMP, MQP, flowlet switching, and packet spraying — each offering progressively better traffic distribution. But how do we *quantify* "better"? Saying one approach is "more balanced" than another is meaningless without a metric. The industry-standard metric for this is the **Coefficient of Variation (CoV)** of per-link load.
+The preceding sections describe several approaches to improving RoCEv2 traffic distribution. Static ECMP, flowlet switching, and packet spraying are network-level load balancing strategies (decisions made by switches), while MQP is an endpoint software technique that creates more flows for ECMP to distribute. Each offers progressively better traffic distribution. But how do we *quantify* "better"? Saying one approach is "more balanced" than another is meaningless without a metric. The industry-standard metric for this is the **Coefficient of Variation (CoV)** of per-link load.
 
 ### What Is CoV?
 
@@ -133,6 +133,55 @@ The result is a dimensionless number that captures how *uniformly* traffic is sp
 - **CoV > 0**: Some links carry more traffic than others. The higher the value, the worse the imbalance.
 
 Because CoV is normalized by the mean, it allows fair comparison across different fabric sizes and traffic volumes. A CoV of 0.25 means the same thing whether you have 4 spine links or 64 — roughly 25% variation around the average load.
+
+### Calculating CoV: A Simple Example
+
+Suppose a Leaf-Spine fabric has 4 spine links. During an AllReduce collective, we measure the throughput on each link over a 1-second window:
+
+```
+Link 1:  350 Gb/s
+Link 2:  280 Gb/s
+Link 3:  310 Gb/s
+Link 4:  260 Gb/s
+```
+
+**Step 1 — Compute the mean (μ):**
+
+```
+μ = (350 + 280 + 310 + 260) / 4 = 1200 / 4 = 300 Gb/s
+```
+
+**Step 2 — Compute each link's deviation from the mean:**
+
+```
+Link 1:  350 - 300 = +50
+Link 2:  280 - 300 = -20
+Link 3:  310 - 300 = +10
+Link 4:  260 - 300 = -40
+```
+
+**Step 3 — Square the deviations and compute the variance:**
+
+```
+Variance = (50² + 20² + 10² + 40²) / 4
+         = (2500 + 400 + 100 + 1600) / 4
+         = 4600 / 4
+         = 1150
+```
+
+**Step 4 — Take the square root to get the standard deviation (σ):**
+
+```
+σ = √1150 ≈ 33.9 Gb/s
+```
+
+**Step 5 — Divide by the mean to get CoV:**
+
+```
+CoV = σ / μ = 33.9 / 300 ≈ 0.113
+```
+
+A CoV of ~0.11 tells us there is moderate imbalance. For comparison, if all four links carried exactly 300 Gb/s, CoV would be 0 (perfect balance). If one link carried all 1,200 Gb/s and the rest carried nothing, CoV would be 1.73 (catastrophic imbalance).
 
 ### Why CoV Matters for AI Training
 
@@ -181,7 +230,7 @@ These thresholds explain why the industry has progressively moved from ECMP towa
 
 ## MRC: Multipath Reliable Connection
 
-The preceding sections traced a progression of increasingly severe problems: [single-path RC pinning](#the-rc-ordering-constraint) causes [elephant flow collisions](#why-this-breaks-at-ai-scale) that ECMP cannot resolve, [QP scaling](#qp-scaling-the-software-workaround) provides diminishing returns, [flowlet switching](#flowlet-switching) cannot reroute continuous streams, and [packet spraying](#packet-spraying) violates RC's ordering guarantees. Each workaround addresses a symptom while leaving the root constraints intact: single-path delivery, Go-Back-N retransmission, and PFC-enforced losslessness.
+The preceding sections traced a progression of increasingly severe problems: [single-path RC pinning](#the-rc-ordering-constraint) causes [elephant flow collisions](#why-this-breaks-at-ai-scale) that ECMP cannot resolve, [QP scaling](#qp-scaling-mqp-the-software-workaround) provides diminishing returns, [flowlet switching](#flowlet-switching) cannot reroute continuous streams, and [packet spraying](#packet-spraying) violates RC's ordering guarantees. Each workaround addresses a symptom while leaving the root constraints intact: single-path delivery, Go-Back-N retransmission, and PFC-enforced losslessness.
 
 RoCEv2 transports InfiniBand packets over Ethernet by encapsulating them inside UDP/IP. The InfiniBand specification defines three primary transport services — RC, UC, and UD (see the [InfiniBand deep dive](https://github.com/ManiAm/RDMA-Primer/blob/master/docs/02_README_INFINIBAND.md#transport-services)) — and RoCEv2 reuses them directly. **Multipath Reliable Connection (MRC)** adds multipath capabilities on top of RC, exclusively in the RoCEv2/Ethernet context. It does not define a new InfiniBand transport service, nor does it operate over native InfiniBand fabrics. MRC was released as an open specification through the Open Compute Project (OCP) in May 2026. It eliminates the root constraints identified above.
 
