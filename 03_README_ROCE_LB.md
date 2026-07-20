@@ -48,33 +48,72 @@ This is the fundamental mismatch: ECMP was designed for a world of many small, s
 
 ### QP Scaling (MQP): The Software Workaround
 
-The most common software-level approach to improving RoCEv2 load balancing is **QP scaling**, also known as **Multiple Queue Pairs (MQP)**. The core idea is simple: instead of sending a transfer over a single QP, the application (or collective communication library such as NCCL) opens multiple QPs to the same destination. Each QP is assigned a different UDP source port, so ECMP treats each one as a separate flow and hashes them independently across different spine links — turning one elephant flow into several smaller, well-distributed flows.
+The most common software-level approach to improving RoCEv2 load balancing is **QP scaling**, also known as **Multiple Queue Pairs (MQP)**. The core idea is simple: instead of sending a transfer over a single QP, the application (or collective communication library such as NCCL) opens multiple QPs to the same destination. Since each QP produces a distinct [UDP source port](#rocev2-entropy-the-udp-source-port), ECMP hashes them to different spine links — turning one elephant flow into multiple independent flows distributed across different paths.
 
-For example, if a single 400 Gb/s transfer is split across 4 QPs, each QP carries approximately 100 Gb/s. Because ECMP hashes each QP independently, the probability that all four collide on the same link drops significantly compared to a single QP.
+Because each RC QP is [confined to a single forwarding path](#the-rc-ordering-constraint), a single QP can only utilize the bandwidth of one physical route. By splitting a large transfer across N QPs, the application creates N independent flows that the fabric can route over N different paths, potentially achieving N× the single-path throughput. This is particularly impactful in leaf-spine topologies where many equal-cost paths exist between endpoints.
 
 There are two common MQP strategies:
 
 | Strategy        | How it works | Best for |
-|-----------------|-------------|----------|
+|-----------------|--------------|----------|
 | **Split**       | A single large message is divided across multiple QPs simultaneously | Latency-sensitive large transfers |
 | **Round-robin** | Successive messages are posted to different QPs in rotation | Sustained throughput workloads |
 
-Meta deployed QP scaling across their production AI training clusters and measured its impact on AllReduce bandwidth. The figure below (from [Meta's SIGCOMM 2024 paper](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)) compares these two strategies at QP counts of 1, 4, and 16. Key findings:
+The following examples illustrate the difference. In both cases, a node has 4 QPs to the same destination, each routed over a separate spine link at 100 Gb/s per QP:
 
-- **Round-robin with 16 QPs** achieves near-100% normalized bandwidth for large messages (2 GB).
+```text
+Split (one 8 MB message):
+  The 8 MB buffer is divided into 4 × 2 MB chunks.
+  All 4 QPs transmit their chunk simultaneously.
+
+  QP 1 ──► 2 MB ──► spine A ─┐
+  QP 2 ──► 2 MB ──► spine B ─┼──► receiver reassembles 8 MB
+  QP 3 ──► 2 MB ──► spine C ─┤
+  QP 4 ──► 2 MB ──► spine D ─┘
+
+  Completion time ≈ 2 MB / 100 Gb/s ≈ 160 µs  (4× faster than a single QP)
+  The application must wait for all 4 QPs to finish and reassemble the buffer.
+
+Round-robin (four successive 8 MB messages):
+  Each message is posted to the next QP in rotation.
+
+  Message 1 ──► QP 1 ──► spine A   (t = 0)
+  Message 2 ──► QP 2 ──► spine B   (t = 0)
+  Message 3 ──► QP 3 ──► spine C   (t = 0)
+  Message 4 ──► QP 4 ──► spine D   (t = 0)
+
+  Each message takes ≈ 640 µs individually (8 MB / 100 Gb/s).
+  But all 4 are in flight concurrently on different paths.
+  Aggregate throughput = 4 × 100 Gb/s = 400 Gb/s (full bisection bandwidth).
+  No cross-QP reassembly needed — each message is self-contained.
+```
+
+In short, split trades reassembly complexity for lower completion time on a single large transfer, while round-robin achieves higher sustained throughput by keeping all paths busy with independent, self-contained messages that require no cross-QP coordination.
+
+Meta deployed QP scaling across their production AI training clusters and measured its impact on AllReduce bandwidth. The figure below (from [Meta's SIGCOMM 2024 paper](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)) compares these two strategies at QP counts of 1, 4, and 16.
+
+Note that "Message Size" on the x-axis is the **AllReduce buffer size**, not a single RDMA send. A collective operation like AllReduce internally decomposes into many individual RDMA transfers — for example, NCCL's ring-based AllReduce with N GPUs generates at least 2×(N−1) separate RDMA sends. This is why round-robin remains effective even at small buffer sizes — the collective always produces many individual transfers to distribute across QPs. Key findings:
+
+- **Round-robin with 16 QPs** achieves near-100% normalized bandwidth for large buffers (2 GB).
 - **Single QP** (the "out of box" baseline) reaches only ~60%.
 
-The improvement is most pronounced for large messages where elephant flows dominate; for small messages (2–8 MB), even 16 QPs provide limited benefit because the transfers are too short to create sustained congestion.
+The improvement is most pronounced for large buffers where individual RDMA transfers are large enough to become elephant flows that saturate a single link for extended periods. For small buffers (2–8 MB), each transfer completes quickly regardless of path assignment, so distributing them across additional QPs yields little additional throughput.
 
 <img src="./pics/qp-scaling-meta.png" width="550"/>
 
-However, QP scaling has practical limits:
+QP scaling introduces significant trade-offs:
 
-- **Diminishing returns**: Experiments show negligible improvement beyond 8–16 QPs. With more QPs, the probability of *some* collision remains high (birthday paradox with more draws), and the overhead of managing additional QPs increases.
+- **HCA resource consumption**: Each QP occupies hardware context memory on the HCA (connection state, sequence counters, retry timers). Creating hundreds of QPs to a single peer can exhaust finite hardware resources and increase cache pressure within the NIC, degrading performance for all connections.
 
-- **Application complexity**: The sending and receiving applications must coordinate multiple QPs, manage multiple completion queues, and ensure correct data reassembly. Collective communication libraries absorb this complexity, but it adds software overhead.
+- **Application-level reassembly**: When data is split across multiple QPs, each QP delivers its portion independently. The application (or middleware) must track which segments have completed and reassemble the logical buffer before consuming it. The hardware provides no cross-QP ordering guarantees.
 
-- **Does not eliminate collisions**: QP scaling reduces the probability of worst-case collisions but does not prevent them. At large scale (hundreds of thousands of QPs across thousands of nodes), collisions are still statistically inevitable.
+- **Completion complexity**: Polling or waiting on multiple Completion Queues (or a shared CQ serving many QPs) increases software overhead and CPU utilization that partially offsets the throughput benefit.
+
+- **Diminishing returns**: Beyond a certain QP count (typically 8–16), the probability that all QPs land on distinct paths decreases — hash collisions become likely (a birthday-paradox effect) — and the management overhead of additional QPs outweighs the bandwidth gain.
+
+- **Cluster-wide collisions remain inevitable**: Even with optimal per-node QP counts, a large cluster with hundreds of thousands of QPs across thousands of nodes will still produce hash collisions somewhere in the fabric — a consequence of mapping a finite entropy space (16-bit UDP source port) to a limited number of spine paths.
+
+In practice, the optimal QP count is a performance-engineering trade-off shaped by the fabric topology (number of equal-cost paths), the HCA's context memory capacity, and the workload's transfer pattern. Libraries such as NCCL tune this parameter internally based on the target platform.
 
 QP scaling is a pragmatic improvement within the constraints of single-path RC, but it does not solve the fundamental problem. True resolution requires either the network or the transport protocol to support per-packet multi-path operation.
 
@@ -93,7 +132,7 @@ For RoCEv2, flowlet switching is the safe, protocol-compatible choice because it
 
 In packet-spray mode, the switch abandons flow affinity entirely. Every packet is independently routed to the least-congested spine link. This shatters elephant flows across all available paths, achieving near-perfect link utilization.
 
-The problem is that packets from the same QP take different paths with different latencies and arrive out of order. Standard RoCEv2 NICs interpret this as packet loss and trigger Go-Back-N retransmission, destroying throughput. Packet spraying therefore cannot be used with standard RC unless the receiving NIC can handle reordering.
+The problem is that packets from the same QP take different paths with different latencies and arrive out of order — triggering the [Go-Back-N retransmission collapse](#the-rc-ordering-constraint) described earlier. Packet spraying therefore cannot be used with standard RC unless the receiving NIC can handle reordering.
 
 Two approaches have emerged, each removing a constraint that limited the previous one:
 
