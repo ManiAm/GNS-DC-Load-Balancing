@@ -22,7 +22,7 @@ To make intelligent rerouting decisions, the switch must first reliably measure 
 
 ### Port Grading
 
-Port Grading assigns a congestion classification to each egress port based on its **instantaneous** raw buffer occupancy. In high-performance fabrics reacting to instantaneous buffer states is paramount to preventing immediate packet drops. The switch reads the raw buffer occupancy of each port and maps it to operator-configurable thresholds, assigning a discrete grade:
+Port Grading assigns a congestion classification to each egress port based on its **instantaneous** raw buffer occupancy. In high-performance fabrics, reacting to instantaneous buffer states is paramount to preventing immediate packet drops. The switch reads the raw buffer occupancy of each port and maps it to operator-configurable thresholds, assigning a discrete grade:
 
 | Buffer Occupancy              | Grade | Meaning              |
 |:------------------------------|:-----:|:---------------------|
@@ -82,27 +82,31 @@ Why EWMA Suits Adaptive Routing:
 
 ## Adaptive Routing Algorithms
 
-The previous sections established *how* the switch measures congestion (Port Grading for instantaneous detection, Quality Scoring for smoothed ranking). What remains is *when* and *at what granularity* the switch applies these measurements to make forwarding decisions. This is where the choice of algorithm matters. The two primary modes (Flowlet and Packet-Spray) represent fundamentally different trade-offs between preserving packet order and maximizing link utilization.
+The previous sections established *how* the switch measures congestion (Port Grading for instantaneous detection, Quality Scoring for smoothed ranking). What remains is *when* and *at what granularity* the switch applies these measurements to make forwarding decisions. This is where the choice of algorithm matters.
+
+The two primary algorithms — Flowlet and Packet-Spray — represent fundamentally different trade-offs between preserving packet order and maximizing link utilization. Before diving into each, it is essential to understand *why* packet ordering matters so much.
+
+
+### The Packet Reordering Constraint
+
+The most aggressive form of load balancing would route every individual packet independently across all available links. This achieves near-perfect utilization but introduces a critical challenge: packets within a single flow will experience different path latencies. A packet sent later on a fast path arrives before a packet sent earlier on a slow path, causing **out-of-order delivery**.
+
+Why is this a problem? It depends on the transport protocol running on the receiving server:
+
+**TCP** guarantees ordered delivery to the application. When packets arrive out of sequence, the receiver must buffer the early arrivals and wait for the missing ones to fill the gaps. While buffering, TCP interprets the disorder as a sign of packet loss — it sends duplicate ACKs back to the sender, which triggers unnecessary retransmissions that waste bandwidth and reduce throughput.
+
+**RoCE** (RDMA over Converged Ethernet) is far more sensitive. Traditional NICs lack the hardware capability to buffer and reorder large volumes of out-of-order data at line rate. In standard RoCE Reliable Connection (RC) mode, a single misordered packet can trigger a "go-back-N" retransmission of the entire outstanding send queue, effectively stalling the transfer.
+
+> RDMA and RoCE are covered in detail in the [RDMA Primer](https://github.com/ManiAm/RDMA-Primer).
+
+This constraint shapes the two adaptive routing algorithms:
+
+- **Flowlet Mode** avoids reordering entirely by only rerouting during natural gaps in traffic.
+- **Packet-Spray Mode** accepts reordering as inevitable and requires the receiving NIC to have dedicated hardware reorder buffers.
 
 
 
 ### Flowlet Mode
-
-#### Why Not Just Distribute Packets?
-
-Historically, the industry standard has been ECMP routing, which uses a mathematical hash of the packet headers to pin an entire flow to a single output interface. While computationally simple, this approach is blind to actual traffic volume. Multiple elephant flows can hash to the same link, causing severe congestion and packet drops while parallel links sit entirely idle.
-
-The logical solution is to break the flow apart by distributing individual packets across all available output interfaces. However, this introduces a critical challenge: the **packet reordering constraint**.
-
-#### The Packet Reordering Constraint
-
-If we distribute a flow's packets across multiple links, those packets will experience different path latencies. A packet sent later on a fast path will arrive before a packet sent earlier on a slow path. This creates a serious problem for the protocols running on the receiving server.
-
-**TCP** guarantees ordered delivery to the application. When packets arrive out of sequence, the receiver must buffer the early arrivals and wait for the missing ones to fill the gaps. While buffering, TCP interprets the disorder as a sign of packet loss — it sends duplicate ACKs back to the sender, which triggers unnecessary retransmissions that waste bandwidth and reduce throughput.
-
-**RoCE** (RDMA over Converged Ethernet) is more sensitive. Traditional NICs lack the hardware capability to buffer and reorder large volumes of out-of-order data at line rate. In standard RoCE Reliable Connection (RC) mode, a single misordered packet can trigger a "go-back-N" retransmission of the entire outstanding send queue, effectively stalling the transfer.
-
-> RDMA and RoCE are covered in detail in the [RDMA Primer](https://github.com/ManiAm/RDMA-Primer).
 
 #### What Is a Flowlet?
 
@@ -143,39 +147,91 @@ Flowlet switching is highly conservative. Under zero congestion, it behaves exac
 
 #### Hardware Constraints
 
-Because flowlet algorithm requires remembering the state and timestamp of every active flow, it is limited by hardware memory. When the flow table is full, the switch must either evict an old entry (which risks reordering if that flow suddenly wakes up) or fall back to static routing for new flows. Therefore, the size of the flow table (`max_flows`) is a critical hardware resource.
+Because the flowlet algorithm requires remembering the state and timestamp of every active flow, it is limited by hardware memory. When the flow table is full, the switch must either evict an old entry (which risks reordering if that flow suddenly wakes up) or fall back to static routing for new flows. Therefore, the size of the flow table (`max_flows`) is a critical hardware resource.
 
 
 
 ### Packet-Spray Mode
 
-While Flowlet switching is highly effective, it is fundamentally conservative: it relies on natural pauses in traffic to safely move flows. However, some high-performance workloads—particularly continuous high-bandwidth streams in storage and AI/ML training fabrics—produce massive "elephant flows" that never pause. For these continuous streams, Flowlet switching may never find a safe opportunity to reroute, leaving links heavily unbalanced. To address this, Packet-Spray takes a much more aggressive, stateless approach to load balancing.
+While Flowlet switching is highly effective, it is fundamentally conservative: it relies on natural pauses in traffic to safely move flows. However, some high-performance workloads — particularly continuous high-bandwidth streams in storage and AI/ML training fabrics — produce massive "elephant flows" that never pause. For these continuous streams, Flowlet switching may never find a safe opportunity to reroute, leaving links heavily unbalanced. To address this, Packet-Spray takes a much more aggressive, stateless approach to load balancing.
 
-#### The Concept of Packet Spraying
+#### How It Works
 
-In Packet-Spray mode, every single packet is routed independently ([A. Dixit et al., *"On the Impact of Packet Spraying in Data Center Networks,"* IEEE INFOCOM, 2013](https://ieeexplore.ieee.org/document/6566872)). The switch completely abandons the concept of flow affinity. There is no per-flow state, no 5-tuple tracking, no flow table, and no idle timers. Because each packet independently seeks out the best path, a single massive elephant flow is instantly shattered and distributed across all available links.
+In Packet-Spray mode, every single packet is routed independently ([A. Dixit et al., *"On the Impact of Packet Spraying in Data Center Networks,"* IEEE INFOCOM, 2013](https://ieeexplore.ieee.org/document/6566872)). The switch completely abandons flow affinity. There is no per-flow state, no 5-tuple tracking, no flow table, and no idle timers. Because each packet independently seeks out the best path, a single massive elephant flow is instantly shattered and distributed across all available links.
 
 - Packet 1 → Spine 3 (least congested)
 - Packet 2 → Spine 1 (least congested now)
 - Packet 3 → Spine 4 (least congested now)
 - Packet 4 → Spine 2 (least congested now)
 
+The congestion metrics (Grading and Quality Scoring) are consulted on every single packet at wire speed:
+
+1. **Evaluate Grade**: The ASIC evaluates the instantaneous Grade of all available ECMP member ports to isolate the set of "Free" candidates.
+
+2. **Evaluate Quality**: Among those Free candidates, the switch consults the Quality Score.
+
+3. **Select Port**: The switch uses `random-from-best` to choose the egress port.
+
 Packet spraying achieves near-perfect load distribution across all links. No single elephant flow can saturate one path — its packets are spread across all paths.
 
-#### How the Algorithm Works (Step-by-Step)
+#### Endpoint Requirements
 
-In Packet-Spray mode, the congestion metrics (Grading and Quality Scoring) are consulted on every single packet at wire speed:
+As established in the [Packet Reordering Constraint](#the-packet-reordering-constraint), distributing a flow's packets across multiple paths causes out-of-order delivery. Flowlet switching avoids this entirely by only rerouting during idle gaps. Packet-Spray, by contrast, accepts reordering as inevitable and shifts the burden to the **receiving NIC**. Deploying Packet-Spray requires endpoint NICs with dedicated hardware reorder buffers capable of reassembling packets by sequence number at line rate. Without this capability, out-of-order packets would trigger retransmissions and cripple throughput. Modern high-performance NICs (such as NVIDIA ConnectX-7 and AMD Pollara) include this hardware natively.
 
-- **Evaluate Grade**: The ASIC evaluates the instantaneous Grade of all available ECMP member ports to isolate the set of "Free" candidates.
 
-- **Evaluate Quality**: Among those Free candidates, the switch consults the Quality Score.
+### AR Eligibility Marking (The AR Bit)
 
-- **Select Port**: The switch uses `random-from-best` to choose the egress port.
+The previous section established that Packet-Spray requires destination NICs with hardware reorder capability. But this creates a practical deployment problem: **how does a switch know which packets are safe to adaptively route?**
 
-#### The Reordering Requirement
+A real data center does not upgrade every NIC at once. During migration, the fabric will contain a mix of modern NICs (e.g., ConnectX-7) that handle out-of-order RoCE packets and legacy NICs (e.g., ConnectX-5 or third-party adapters) that require strict in-order delivery. Without a signaling mechanism, the operator faces a binary choice: enable AR globally (breaking legacy NICs) or disable it globally (wasting the capability of modern NICs). Neither option is acceptable.
 
-As discussed in the [Packet Reordering Constraint](#the-packet-reordering-constraint), distributing a flow's packets across multiple paths causes out-of-order delivery. Flowlet switching avoids this entirely by only rerouting during idle gaps. Packet-Spray, by contrast, accepts reordering as inevitable and shifts the burden to the **receiving NIC**. Deploying Packet-Spray requires endpoint NICs with dedicated hardware reorder buffers capable of reassembling packets by sequence number at line rate. Without this capability, out-of-order packets would trigger retransmissions and cripple throughput. Modern high-performance NICs (such as NVIDIA ConnectX-7 and AMD Pollara) include this hardware natively.
+#### The Solution: Per-Packet AR Eligibility
 
+To solve this, the **source NIC** marks every RoCE packet with an **AR eligibility indication** before it enters the network. This indication tells every switch in the path whether the packet is permitted to undergo Adaptive Routing or must be forwarded using static ECMP.
+
+The marking is a single bit in the RoCE **Base Transport Header (BTH)** — the InfiniBand transport header encapsulated inside the Ethernet frame. The BTH specification includes a 7-bit "Reserved" field, and the Most Significant Bit (MSB) of this field is repurposed as the AR eligibility flag:
+
+- **Bit = 1**: The packet is **eligible** for AR. The switch may use Flowlet or Packet-Spray to route it.
+- **Bit = 0**: The packet is **ineligible** for AR. The switch must use static ECMP hash-based routing.
+
+```
+RoCE Packet Structure:
+
+┌──────────┬──────────┬──────────┬─────────────────────────────────┐
+│ Ethernet │   IP     │   UDP    │     InfiniBand BTH              │
+│ Header   │ Header   │ Header   │  ┌────────────────────────────┐ │
+│  (L2)    │  (L3)    │  (L4)    │  │ OpCode │ ... │ Reserved(7) │ │
+│          │          │          │  │              │  ↑ AR bit   │ │
+│          │          │          │  └────────────────────────────┘ │
+└──────────┴──────────┴──────────┴─────────────────────────────────┘
+                                           ▲
+                                    Switch reads this
+                                    L4 bit to decide
+                                    AR vs. static ECMP
+```
+
+Note that Ethernet switches are Layer-2 devices, yet they are reading a bit from the Layer-4 InfiniBand header. This deliberate cross-layer inspection is necessary because the BTH is the only header the source NIC fully controls that carries the transport-session context needed to make this decision.
+
+#### How the Decision Is Made
+
+The source NIC does not blindly guess — it uses an **auto-negotiation** handshake with the destination NIC when establishing a RoCE connection. During this exchange, each NIC reports its capabilities, including whether it can process packets that arrive out of order. The source NIC records this capability per peer and uses it to stamp every outgoing packet:
+
+1. **Connection Setup**: Source NIC initiates a connection to a destination NIC.
+2. **Capability Exchange**: The destination NIC reports whether it supports OOO (out-of-order) packet processing.
+3. **Per-Packet Stamping**: For every subsequent packet in this connection, the source NIC sets the AR bit based on the negotiated result — `1` if the destination supports OOO, `0` if it does not.
+4. **Switch Action**: Every switch along the path extracts the bit and applies AR or static routing accordingly.
+
+This means the network automatically adapts to the capabilities of each endpoint. Traffic destined for a modern ConnectX-7 with reorder hardware gets full Packet-Spray benefits, while traffic destined for a legacy NIC is safely pinned to static ECMP — all within the same fabric, at the same time, with zero operator intervention per flow.
+
+#### Override Mechanisms
+
+Two override mechanisms provide additional control:
+
+- **Host Override**: The server's host software (OS or driver) can override the NIC's auto-negotiation result. Even if the destination NIC advertised OOO support, the host can force AR = 0 for specific connections. This handles edge cases such as a destination NIC with known reorder bugs, or an application that requires strict ordering regardless of hardware capability.
+
+- **Per-Packet Exception**: The source NIC can force static routing for individual packets within a flow that is otherwise AR-eligible. Certain control messages (e.g., connection management packets) within an RDMA session may require strict ordering even when the bulk data transfer can tolerate reordering.
+
+> **Reference:** This mechanism is described in Mellanox/NVIDIA [US Patent 12,328,251 B2](https://patents.google.com/patent/US12328251B2/en), *"Marking of RDMA-over-Converged-Ethernet (RoCE) Traffic Eligible for Adaptive Routing,"* granted June 2025. The patent covers the NIC-side marking, the switch-side extraction, and the auto-negotiation protocol. Juniper Networks has since adopted a similar approach using the BTH for load-balancing decisions ([US 12,526,234 B1](https://patents.google.com/patent/US12526234B1/en), granted January 2026).
 
 
 ### Comparing Flowlet vs. Packet Spray
@@ -220,7 +276,7 @@ The following diagram summarizes how all the components discussed above fit toge
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2. Traffic Classification                                          │
 │     Is this packet eligible for adaptive routing?                   │
-│     (protocol, port, ACL)                                           │
+│     (protocol, port, ACL, AR bit in BTH)                            │
 │                                                                     │
 │   NO → static ECMP hash. Done.                                      │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -275,6 +331,11 @@ From Spine 1's perspective, local adaptive routing can detect this congestion on
 
 The real problem is upstream. TOR 1 and TOR 2 are the switches that *chose* to send traffic to Spine 1 in the first place. If TOR 1 knew that Spine 1's downlink to TOR 3 was congested, it could reroute Flow 1 to Spine 2 instead. But TOR 1 has no visibility into Spine 1's egress ports — its local adaptive routing only monitors its own uplinks to the spines, which may appear perfectly healthy.
 
+In summary, local AR creates a fundamental mismatch:
+
+- **The switch that detects the congestion** (Spine 1) cannot fix it — it has only one path to the destination leaf.
+- **The switch that can fix the congestion** (TOR 1) cannot detect it — the congestion is not on any of its own ports.
+
 ### Adaptive Routing Notifications (ARN)
 
 **Adaptive Routing Notifications (ARN)** solve this blind spot by enabling switches to propagate congestion information **backward** (upstream) through the network. When a switch detects congestion on an egress port that it cannot resolve locally, it generates an ARN and sends it to the upstream switch feeding the congested traffic, transforming routing from a purely local decision into a **network-wide** (global) one.
@@ -293,14 +354,7 @@ The ARN mechanism works as follows:
 
 <img src="./pics/g_adaptive_2.png" alt="segment" width="800">
 
-### Why Local Adaptive Routing Cannot Solve This
-
-Without ARN, each switch is limited to monitoring only its own egress buffers. In a Leaf-Spine fabric, this creates a fundamental mismatch:
-
-- **The switch that detects the congestion** (Spine 1) cannot fix it — it has only one path to the destination leaf.
-- **The switch that can fix the congestion** (TOR 1) cannot detect it — the congestion is not on any of its own ports.
-
-ARN bridges this gap by carrying congestion signals from the point of detection back to the point of action. In larger multi-tier fabrics (3-stage or 5-stage Clos), ARNs can be forwarded through multiple hops, allowing congestion information to propagate all the way back to the ingress leaf where the original path selection is made.
+In larger multi-tier fabrics (3-stage or 5-stage Clos), ARNs can be forwarded through multiple hops, allowing congestion information to propagate all the way back to the ingress leaf where the original path selection is made.
 
 ### ARN: Standards and Packet Format
 
