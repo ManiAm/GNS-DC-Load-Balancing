@@ -178,60 +178,8 @@ Packet spraying achieves near-perfect load distribution across all links. No sin
 
 As established in the [Packet Reordering Constraint](#the-packet-reordering-constraint), distributing a flow's packets across multiple paths causes out-of-order delivery. Flowlet switching avoids this entirely by only rerouting during idle gaps. Packet-Spray, by contrast, accepts reordering as inevitable and shifts the burden to the **receiving NIC**. Deploying Packet-Spray requires endpoint NICs with dedicated hardware reorder buffers capable of reassembling packets by sequence number at line rate. Without this capability, out-of-order packets would trigger retransmissions and cripple throughput. Modern high-performance NICs (such as NVIDIA ConnectX-7 and AMD Pollara) include this hardware natively.
 
+In mixed environments where some NICs support reordering and others do not, a per-packet signaling mechanism tells the switch whether each packet is safe to spray. For RoCEv2, this is the [AR eligibility bit](./03_README_ROCE_LB.md#ar-eligibility-marking-the-ar-bit) embedded in the InfiniBand BTH header.
 
-### AR Eligibility Marking (The AR Bit)
-
-The previous section established that Packet-Spray requires destination NICs with hardware reorder capability. But this creates a practical deployment problem: **how does a switch know which packets are safe to adaptively route?**
-
-A real data center does not upgrade every NIC at once. During migration, the fabric will contain a mix of modern NICs (e.g., ConnectX-7) that handle out-of-order RoCE packets and legacy NICs (e.g., ConnectX-5 or third-party adapters) that require strict in-order delivery. Without a signaling mechanism, the operator faces a binary choice: enable AR globally (breaking legacy NICs) or disable it globally (wasting the capability of modern NICs). Neither option is acceptable.
-
-#### The Solution: Per-Packet AR Eligibility
-
-To solve this, the **source NIC** marks every RoCE packet with an **AR eligibility indication** before it enters the network. This indication tells every switch in the path whether the packet is permitted to undergo Adaptive Routing or must be forwarded using static ECMP.
-
-The marking is a single bit in the RoCE **Base Transport Header (BTH)** — the InfiniBand transport header encapsulated inside the Ethernet frame. The BTH specification includes a 7-bit "Reserved" field, and the Most Significant Bit (MSB) of this field is repurposed as the AR eligibility flag:
-
-- **Bit = 1**: The packet is **eligible** for AR. The switch may use Flowlet or Packet-Spray to route it.
-- **Bit = 0**: The packet is **ineligible** for AR. The switch must use static ECMP hash-based routing.
-
-```
-RoCE Packet Structure:
-
-┌──────────┬──────────┬──────────┬─────────────────────────────────┐
-│ Ethernet │   IP     │   UDP    │     InfiniBand BTH              │
-│ Header   │ Header   │ Header   │  ┌────────────────────────────┐ │
-│  (L2)    │  (L3)    │  (L4)    │  │ OpCode │ ... │ Reserved(7) │ │
-│          │          │          │  │              │  ↑ AR bit   │ │
-│          │          │          │  └────────────────────────────┘ │
-└──────────┴──────────┴──────────┴─────────────────────────────────┘
-                                           ▲
-                                    Switch reads this
-                                    L4 bit to decide
-                                    AR vs. static ECMP
-```
-
-Note that Ethernet switches are Layer-2 devices, yet they are reading a bit from the Layer-4 InfiniBand header. This deliberate cross-layer inspection is necessary because the BTH is the only header the source NIC fully controls that carries the transport-session context needed to make this decision.
-
-#### How the Decision Is Made
-
-The source NIC does not blindly guess — it uses an **auto-negotiation** handshake with the destination NIC when establishing a RoCE connection. During this exchange, each NIC reports its capabilities, including whether it can process packets that arrive out of order. The source NIC records this capability per peer and uses it to stamp every outgoing packet:
-
-1. **Connection Setup**: Source NIC initiates a connection to a destination NIC.
-2. **Capability Exchange**: The destination NIC reports whether it supports OOO (out-of-order) packet processing.
-3. **Per-Packet Stamping**: For every subsequent packet in this connection, the source NIC sets the AR bit based on the negotiated result — `1` if the destination supports OOO, `0` if it does not.
-4. **Switch Action**: Every switch along the path extracts the bit and applies AR or static routing accordingly.
-
-This means the network automatically adapts to the capabilities of each endpoint. Traffic destined for a modern ConnectX-7 with reorder hardware gets full Packet-Spray benefits, while traffic destined for a legacy NIC is safely pinned to static ECMP — all within the same fabric, at the same time, with zero operator intervention per flow.
-
-#### Override Mechanisms
-
-Two override mechanisms provide additional control:
-
-- **Host Override**: The server's host software (OS or driver) can override the NIC's auto-negotiation result. Even if the destination NIC advertised OOO support, the host can force AR = 0 for specific connections. This handles edge cases such as a destination NIC with known reorder bugs, or an application that requires strict ordering regardless of hardware capability.
-
-- **Per-Packet Exception**: The source NIC can force static routing for individual packets within a flow that is otherwise AR-eligible. Certain control messages (e.g., connection management packets) within an RDMA session may require strict ordering even when the bulk data transfer can tolerate reordering.
-
-> **Reference:** This mechanism is described in Mellanox/NVIDIA [US Patent 12,328,251 B2](https://patents.google.com/patent/US12328251B2/en), *"Marking of RDMA-over-Converged-Ethernet (RoCE) Traffic Eligible for Adaptive Routing,"* granted June 2025. The patent covers the NIC-side marking, the switch-side extraction, and the auto-negotiation protocol. Juniper Networks has since adopted a similar approach using the BTH for load-balancing decisions ([US 12,526,234 B1](https://patents.google.com/patent/US12526234B1/en), granted January 2026).
 
 
 ### Comparing Flowlet vs. Packet Spray
