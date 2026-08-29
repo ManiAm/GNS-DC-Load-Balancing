@@ -261,19 +261,19 @@ When an Elephant flow enters the fabric, it exposes the rigidity of hardware-bas
 
 While that single link is completely overwhelmed and dropping traffic, neighboring parallel spine links connected to the exact same destination might be sitting completely idle. Because standard ECMP is completely unaware of link utilization or flow size, it will happily forward an Elephant flow into a congested bottleneck while ignoring perfectly good, unused bandwidth right next door.
 
-### ECMP Congestion in Practice
+### Hash Collision in Practice
 
-Consider the diagram below, which contrasts an ideal uncongested fabric with a congested one suffering from a hash collision.
+The diagram below shows a concrete hash collision in an 8-leaf, 4-spine fabric. Two independent elephant flows happen to hash to the same spine, congesting a single downlink while parallel paths sit idle.
 
-<img src="./pics/elephent.png" alt="segment" width="950">
+<img src="./pics/ecmp_collision.jpg" alt="ECMP hash collision" width="900">
 
-The left side of the diagram illustrates ECMP working perfectly. A Blue flow (destined for port a) enters Ingress Leaf 1, hashes to Spine 4, and travels down to Egress Leaf 7. A Green flow (destined for port b) enters Ingress Leaf 2, hashes to Spine 5, and travels down to the same Egress Leaf 7. Because the ASIC's hash function mathematically assigned them to different spines, they each traverse dedicated physical links. Both flows operate at 100% capacity without interfering with one another.
+Server 2 (on leaf 1) is sending a large flow to server 9 (on leaf 3). Leaf 1's ASIC hashes the flow's 5-tuple and selects spine 2 as the next hop. The green path (server 2 → leaf 1 → spine 2 → leaf 3 → server 9) carries this flow without issue.
 
-The right side of the diagram illustrates the Elephant Flow problem in action when a new Orange flow (destined for port c) enters the network at Ingress Leaf 3. Leaf 3 uses its static ECMP hash to determine the path for the Orange flow. The math happens to yield the exact same remainder as the Green flow, dictating that the Orange flow must also be sent to Spine 5. Now, Spine 5 is forced to forward both the Green and Orange flows down to Egress Leaf 7 across a single physical link.
+Independently, server 16 (on leaf 6) is sending a large flow to server 7 (also on leaf 3). Leaf 6's ASIC hashes this flow's 5-tuple and also selects spine 2. The blue path (server 16 → leaf 6 → spine 2 → leaf 3 → server 7) now shares the spine 2 → leaf 3 downlink with the green flow.
 
-Because these are massive Elephant flows, they demand more bandwidth than the single link can provide. They congest the link, forcing the switch to drop packets and effectively cutting the throughput of both flows down to 50% capacity. (If these were small Mice flows, they would share the link without noticeable degradation).
+Because both are elephant flows, they demand more bandwidth than the single spine 2 → leaf 3 link can provide. The link saturates, forcing the switch to drop packets and cutting the throughput of both flows roughly in half. Note that if these were small mice flows, they would share the link without noticeable degradation.
 
-This scenario highlights the blind spot of ECMP. Notice that Spine 6 has a completely unobstructed, 100% idle path to Egress Leaf 7. However, because standard ECMP cannot monitor link utilization or dynamically reroute traffic mid-flow, it forces the Orange flow into a bottleneck while parallel bandwidth goes completely unused.
+This is the blind spot of ECMP. Spine 1, spine 3, and spine 4 all have completely idle, unobstructed paths to leaf 3 — yet the ASIC cannot detect the congestion or reroute either flow because ECMP decisions are based solely on the static hash, not on link utilization.
 
 
 ### Hash Collisions Are Statistically Inevitable
