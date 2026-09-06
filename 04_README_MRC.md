@@ -92,7 +92,7 @@ Square brackets mark headers that appear only in some packets.
 | **ImmDt** (Immediate Data) | WriteIMM only | The 32-bit immediate value handed to the receiving application. |
 | **ICRC** (Invariant CRC) | Every packet | The end-to-end integrity check, computed per the InfiniBand Trade Association specification. |
 
-Control packets — SACKs, NACKs, and probes — reuse the same outer encapsulation but carry no application data. Each consists of a BTH followed by a small control header as its payload: SETH for a SACK, NETH for a NACK, PETH for a reliability probe, and ERTH for the connectionless [Endpoint Operations](#failure-detection-and-recovery).
+Control packets — SACKs, NACKs, and probes — reuse the same outer encapsulation but carry no application data. Each consists of a BTH followed by a small control header as its payload: SETH (SACK Extended Transport Header) for a SACK, NETH (NACK Extended Transport Header) for a NACK, PETH (Probe Extended Transport Header) for a reliability probe, and ERTH (Endpoint Request Transport Header) for connectionless [Endpoint Operations](#failure-detection-and-recovery) — node-scoped messages used for path probing and port-status updates, independent of any particular QP.
 
 Two fields outside the InfiniBand headers matter as much as anything inside them. The **UDP source port** and, on IPv6, the **flow label** are where the sender writes the value that chooses the packet's path. That value is the subject of the next several sections.
 
@@ -138,7 +138,7 @@ EVs are grouped into an **EV Profile**, and every QP is associated with exactly 
 
 At QP startup the EV set is generated: typically 128 to 256 entries in total, of which somewhat more than 100 are active and the remainder are held in reserve. Generation draws an equal number of EVs from each plane so that traffic is balanced at the plane level from the very first packet, then picks a random subset of paths within each plane.
 
-The size of the active set is a deliberate trade-off. Too few EVs and the QP cannot spread across enough paths to balance the fabric; too many and each individual path is used so rarely that feedback about it arrives too late to act on. The specification therefore recommends sizing the active set to roughly one or two **congestion windows**' worth of packets — a congestion window is the byte limit on how much data a sender may keep in flight, detailed in [Congestion Control (NSCC)](#congestion-control-nscc) — so that every active path is exercised at least once per round trip and its SACKs stay timely. It notes rapidly diminishing returns beyond about 100 active EVs.
+The size of the active set is a deliberate trade-off. Too few EVs and the QP cannot spread across enough paths to balance the fabric; too many and each individual path is used so rarely that feedback about it arrives too late to act on. The specification therefore recommends sizing the active set to roughly one or two **congestion windows**' worth of packets — a congestion window is the byte limit on how much data a sender may keep in flight, detailed in [Congestion Control (NSCC)](#congestion-control-nscc) — so that every active path is exercised at least once per round trip and its SACKs stay timely. The specification notes rapidly diminishing returns beyond about 100 active EVs.
 
 Profiles are created through a privileged per-node host daemon called the **MRC Controller**. Whether the controller computes the EV values itself or only tells the NIC how to derive them depends on the profile's mode — a choice that interacts with the forwarding model, so [Provisioning the EV Set](#provisioning-the-ev-set) takes it up once all three routing modes have been introduced.
 
@@ -177,7 +177,15 @@ That is the whole loop: spray, observe per-path feedback, demote the paths that 
 
 ## Routing Modes
 
-The EV is the same 32-bit value whichever forwarding model is in use. What a forwarding model decides is how those 32 bits become an actual path: which header fields the network reads, how wide a path encoding those fields can express, and how much control the sender has over the result. MRC defines three such models: ECMP, Structured EV, and SRv6. The largest production deployments use SRv6, the most capable of the three, but the other two matter because they let MRC run on fabrics whose switches cannot do SRv6 forwarding.
+The EV is the same 32-bit value whichever forwarding model is in use. What a forwarding model decides is how those 32 bits become an actual path: which header fields the network reads, how wide a path encoding those fields can express, and how much control the sender has over the result. MRC defines three such models: **ECMP**, **Structured EVs**, and **SRv6**.
+
+| Mode | How the path is chosen | Determinism |
+|------|------------------------|-------------|
+| **ECMP** | The sender varies the entropy fields; the switch hashes them to pick a next hop. Two different EVs may land in the same hash bucket, and the sender cannot tell which. | Low |
+| **Structured EVs** | The 32-bit entropy field is partitioned into per-tier subfields, and each switch maps its own subfield to an egress port via ACLs (Access Control Lists). No encapsulation, but the sender is still bound by how switches interpret the fields. | Medium |
+| **SRv6** | The sender encodes the exact switch-by-switch path into the IPv6 destination address. **Every EV maps to one specific, known physical path**. | Full |
+
+All three modes coexist in the specification, and in all three the switch stays **stateless** with respect to individual connections. The large production deployments use SRv6, the most capable of the three, but the other two matter because they let MRC run on fabrics whose switches cannot do SRv6 forwarding.
 
 ### ECMP
 
@@ -243,33 +251,122 @@ The trade against ECMP is that the switches must be able to parse the entropy fi
 
 ### SRv6 Source Routing
 
-For maximum path control and observability, MRC uses **IPv6 Segment Routing (SRv6)**, a source-routing architecture in which the sending node encodes the complete forwarding path into the IPv6 header so that each intermediate switch simply follows the embedded instructions rather than computing next hops independently. In MRC's SRv6 mode, paths are represented as sequences of 16-bit micro-Segment IDs (uSIDs) packed into the IPv6 destination address:
+For maximum path control and observability, MRC uses **IPv6 Segment Routing (SRv6)**. SRv6 is a rich architecture with its own forwarding model, failure-recovery mechanisms, and network-programming framework; the [Segment Routing Primer](https://github.com/ManiAm/segment-routing/blob/master/docs/SRv6_PRIMER.md) covers it in depth. This section introduces the SRv6 concepts that MRC depends on — source routing, encapsulation, compressed SIDs, and shift-and-lookup forwarding — and then explains how MRC applies them with static tables and per-packet path selection.
 
-1. At QP startup, the NIC or MRC Controller generates the EV set and maps each EV to a specific SRv6 destination address encoding the full path as a stack of uSIDs, one per switch. An optional Segment Routing Header using Compressed Segment List Encoding ([RFC 9800](https://www.rfc-editor.org/rfc/rfc9800.html)) can extend the stack beyond a single 128-bit address, or carry a copy of the original path for debugging.
+#### SRv6 Fundamentals
 
-2. When a packet is sent, the NIC encapsulates it as **IPv6-in-IPv6**. The outer header carries the SRv6 path; the inner header carries the destination NIC's real address for decapsulation. This costs an extra 40-byte IPv6 header on every packet — noticeable against a small message, negligible against the multi-kilobyte MTUs these fabrics use.
+In traditional IP routing, each switch independently decides where to send a packet based on its destination address. **SRv6** inverts that model: the **sending node** encodes the complete forwarding path into the packet header, and each intermediate switch simply follows the embedded instructions rather than computing next hops on its own. This is **source routing** — the source dictates the path.
 
-3. At each hop the switch performs the **uN (micro-node)** behavior in three steps. First, it matches the **Locator** — the shared 32-bit IPv6 prefix that identifies the SRv6 domain, common to every switch in the fabric — together with its own uSID at the leading position of the destination address. Second, it **left-shifts** all uSIDs by 16 bits — the next hop's uSID moves into the leading position and a zero fills the vacated slot at the end. Third, it performs a **/48 static route lookup** on the updated address — the 32-bit Locator plus the now-leading 16-bit uSID, which is exactly where the /48 comes from — and forwards the packet out the corresponding port. Each subsequent switch repeats the same process until the packet reaches its destination. Some deployments also use **uA (micro-argument)** behavior, where a uSID encodes both a target node and an argument such as a specific egress interface, allowing finer-grained decisions within a single hop.
+The key insight is that every SRv6 instruction is a **128-bit IPv6 address** — called a **Segment Identifier (SID)** — that is simultaneously a routable address *and* an executable instruction. Each SID is structured as three fields:
 
-   The following diagram illustrates these three steps at a single switch, showing how the destination address is transformed as the packet passes through.
+- **Locator** (B + N bits): A routable prefix identifying the node that owns this instruction. It splits into a **Block** portion shared by every node in the SR domain and a **Node** portion identifying one specific node within that domain.
 
-   <img src="./pics/srv6-mrc.png" width="550"/>
+- **Function** (F bits): An opcode telling the owning node what to do — forward out a specific interface, decapsulate, look up in a routing table, and so on.
+
+- **Argument** (A bits, optional): Parameters for the function — for example, a flow identifier or a table index.
+
+A path through the network is expressed as an ordered list of SIDs — the **segment list** — carried in the **Segment Routing Header (SRH)**, an IPv6 extension header defined in [RFC 8754](https://www.rfc-editor.org/rfc/rfc8754.html). At each hop, the active SID is always present in the IPv6 **Destination Address**, so transit switches between two segment endpoints forward the packet using ordinary IPv6 destination-address lookup, completely unaware that the packet is source-routed.
+
+#### SRv6 Encapsulation
+
+That last point — the active SID is always in the Destination Address — has an important consequence. SRv6 **overwrites** that Destination Address at every segment endpoint: each hop replaces it with the next SID so that transit routers forward toward the correct next hop. The original packet's real destination address would be destroyed by the first overwrite if it were exposed directly.
+
+The solution is **IPv6-in-IPv6** encapsulation: the sender wraps the original packet inside an **outer** IPv6 header before injecting the segment list. The outer header's Destination Address is consumed by SRv6 forwarding (overwritten hop by hop), while the **inner** header preserves the original destination, untouched, until the final segment endpoint strips the outer header and delivers it. The cost is one extra IPv6 header — 40 bytes — on every packet. The [Segment Routing Primer](https://github.com/ManiAm/segment-routing/blob/master/docs/SRv6_PRIMER.md#srv6-encapsulation-why-two-headers) covers this in detail with a full packet diagram.
+
+This encapsulation is standard SRv6 behavior, not something MRC invented. What MRC adds is **per-packet path selection**: each packet's outer header carries a *different* SRv6 destination address (chosen from the QP's active EV set), so that a single connection's traffic is sprayed across many paths rather than pinned to one.
+
+#### Compressed SIDs (uSIDs)
+
+Each SID in a segment list is 128 bits — 16 bytes. For a five-hop path, the SRH alone costs 8 bytes of fixed header plus 5 × 16 = 80 bytes of SIDs, plus the 40-byte outer IPv6 header for encapsulation — 128 bytes of overhead per packet. That is manageable for large messages but significant for small control and telemetry packets.
+
+**Micro-Segment IDs (uSIDs)** — called Compressed SIDs (C-SIDs) in the standard — are defined in [RFC 9800](https://www.rfc-editor.org/rfc/rfc9800.html). Instead of dedicating a full 128-bit slot to a single instruction, a **uSID container** packs several short identifiers into one 128-bit address. In the standard **F3216** layout (32-bit Locator Block with 16-bit uSIDs):
+
+```text
+128-bit uSID Container (F3216 format):
+
+|<-- 32 bits -->|<- 16b ->|<- 16b ->|<- 16b ->|<- 16b ->|<- 16b ->|<- 16b ->|
+| Locator Block |  uSID1  |  uSID2  |  uSID3  |  uSID4  |  uSID5  |  uSID6  |
+```
+
+The 32-bit **Locator Block** is the shared prefix for the entire SR domain. Each 16-bit **uSID** identifies one switch or one instruction — one hop in the path. Up to **six** uSIDs fit in a single 128-bit address (6 × 16 = 96 bits, plus the 32-bit Locator Block = 128 bits). Unused positions are filled with `0x0000`, which serves as an end-of-container marker. With six hops or fewer, the entire path fits in the IPv6 **destination address** alone — no SRH is needed at all, and the compression adds **zero bytes** beyond the outer IPv6 header that encapsulation already requires.
+
+#### uSID Forwarding: Shift-and-Lookup
+
+At each hop, the switch performs a three-step **shift-and-lookup** operation — the **uN (micro-node)** behavior:
+
+1. **Match**: The switch recognizes the **Locator Block** — the shared 32-bit IPv6 prefix that identifies the SRv6 domain, common to every switch in the fabric — together with its own uSID at the leading position of the destination address. Combined, these form a **/48 prefix** (32 bits of Block + 16 bits of uSID).
+
+2. **Shift**: All uSIDs are **left-shifted** by 16 bits. The next hop's uSID moves into the leading position, and a zero fills the vacated slot at the end.
+
+3. **Lookup**: The switch performs a **/48 route lookup** on the updated address — the Locator Block plus the now-leading uSID — and forwards the packet out the corresponding port.
+
+Each subsequent switch repeats the same process until the packet reaches its destination. Some deployments also use **uA (micro-argument)** behavior, where a uSID encodes both a target node and an argument such as a specific egress interface, allowing finer-grained decisions within a single hop.
+
+The following diagram illustrates these three steps at a single switch, showing how the destination address is transformed as the packet passes through.
+
+<img src="./pics/srv6-mrc.png" width="550"/>
+
+The /48 lookup is a standard longest-prefix-match operation — exactly what any IPv6 switch ASIC already performs at line rate. The only new capability the switch needs is the 16-bit left-shift.
+
+#### How MRC Uses SRv6
+
+Each MRC data packet is encapsulated as IPv6-in-IPv6, as described in [SRv6 Encapsulation](#srv6-encapsulation) above. The outer header carries a uSID container as its destination address; the inner header carries the real address of the destination NIC for decapsulation at the final hop. Each uSID in the outer address identifies a switch and implicitly selects an egress port through the static forwarding table at that switch.
+
+For every packet, the NIC picks an EV from the QP's active set and turns it into an SRv6 destination address. At QP startup, the NIC or MRC Controller generates the EV set and maps each EV to a specific SRv6 destination address encoding the full path as a stack of uSIDs, one per switch. An optional Segment Routing Header using Compressed Segment List Encoding ([RFC 9800](https://www.rfc-editor.org/rfc/rfc9800.html)) can extend the stack beyond a single 128-bit address, or carry a copy of the original path for debugging.
 
 #### Mapping EVs to SRv6 Addresses
 
-The mapping from EV to SRv6 destination address is **algorithmic**, so the NIC only needs to store per-path EV state, not a full 128-bit address per path.
+The mapping from EV to SRv6 destination address is **algorithmic**, so the NIC only needs to store per-path EV state, not a full 128-bit address per path. Doing this by table lookup would mean storing a 128-bit address for each of 128–256 EVs per QP, across thousands of QPs — far too much NIC memory.
 
-Switch uSIDs are allocated according to the network structure, allowing the EV to serve as a compressed representation of the bits that vary between SRv6 paths to a given destination. On QP startup, the NIC looks up the destination address prefix in a node-specific configuration file to obtain a generic SRv6 address **template** for nodes in that destination's row. The destination uSID in this template is then specialized by copying in the last-hop downlink number. This template is shared by all packets sent by the QP.
+Switch uSIDs are not assigned arbitrarily; they are allocated to mirror the fabric's structure, so the bits that differ between two paths to the same destination are exactly the bits the EV carries. That correspondence is what makes the mapping computable. The NIC builds each SRv6 destination address in three steps using a shared **template**:
 
-Each time a packet is sent, a new EV is selected. The template is further specialized by copying the **plane number** from the EV into all uSIDs and the **T0 uplink number** into the T1 uSID, producing the final destination address. Because the mapping is deterministic and reversible, the NIC does not need to store a separate SRv6 address for each EV — it derives the address on the fly from the EV and the template.
+1. **At QP startup**, the NIC looks up the destination address prefix in a node-specific configuration file to obtain a generic SRv6 address template for nodes in that destination's row.
+2. **Still at startup**, the destination uSID in this template is specialized by copying in the last-hop downlink number — which server port the packet must exit on. This is fixed for the life of the QP, so the specialized template is shared by every packet the QP sends.
+3. **At send time**, a new EV is selected. The template is further specialized by copying the **plane number** from the EV into all uSIDs and the **T0 uplink number** into the T1 uSID, producing the final destination address.
+
+For a two-tier path, the resulting destination address is laid out like this:
+
+```text
+| Locator Block | T0 uSID | T1 uSID | dest T0 uSID | 0x0000 |
+```
+
+| Field | Where its value comes from |
+|-------|----------------------------|
+| Locator Block | Fixed for the whole SR domain |
+| T0 uSID | Template, with the EV's plane number copied in |
+| T1 uSID | Template, with the EV's plane number and T0 uplink number copied in |
+| dest T0 uSID | Template, with the EV's plane number and the QP's last-hop downlink number copied in |
+| `0x0000` | End-of-container |
+
+Only a few small fields vary from one EV to the next; everything else comes from the template. Because the mapping is deterministic and reversible, the NIC derives the address on the fly, and an operator holding a bad EV can run the mapping backwards to name the exact link that failed.
 
 The left-shift has one further consequence: the SRv6 address cannot identify the path after the fact. By the time a packet arrives, the address has been mutated at every hop and the original uSID stack is gone. The EV therefore still travels in the UDP source port and IPv6 flow label even in SRv6 mode, where the switches ignore both fields completely and forward on the outer destination address instead. It rides along purely so the responder can echo it in a SACK or NACK, which is what lets the sender attribute that feedback to the path it chose.
 
-Because the tables are static and the path is fully determined by the sender, there is no routing convergence delay, no hash ambiguity, and no switch-level path computation. Link failures are handled entirely by MRC removing the affected EV from its active set.
+#### Why Static Routes Instead of Dynamic Routing
 
-This yields excellent **observability**: since each EV maps deterministically to one physical path, an EV reported as bad identifies the exact failed link or switch, which the opaque ECMP hash cannot do.
+This is where MRC departs most sharply from a conventional SRv6 deployment. In a typical SRv6 network, an IGP (Interior Gateway Protocol) distributes SID information and **TI-LFA** (Topology-Independent Loop-Free Alternate, defined in [RFC 9855](https://www.rfc-editor.org/rfc/rfc9855.html)) handles failure recovery — when a link fails, the detecting switch precomputes a backup segment list and reroutes traffic in the data plane within tens of milliseconds, without waiting for full IGP reconvergence. Recovery is the network's job. (The [Segment Routing Primer](https://github.com/ManiAm/segment-routing/blob/master/docs/SRv6_PRIMER.md) covers TI-LFA in detail.)
 
-Disabling dynamic routing here is deliberate. Two adaptive mechanisms — MRC at the endpoints and dynamic routing in the switches — interact unpredictably: MRC steers away from a failed path, then routing reconverges and remaps ECMP groups, disturbing MRC's balance. Static routes reduce the control plane to a single adaptive layer at the transport.
+MRC inverts that model: forwarding tables are **static**, programmed once at installation and never touched by a routing protocol. No IGP runs, no TI-LFA is configured, and **all** failure recovery happens at the transport layer through the [EV state machine](#the-ev-state-machine).
+
+When a link fails:
+
+1. MRC detects it in sub-milliseconds through missing SACKs or trim notifications.
+2. The affected EV moves to ASSUMED_BAD and is withdrawn from the active set.
+3. A backup EV from the same plane replaces it, preserving equal loading across planes.
+4. No switch table changes, no routing protocol runs, and there is no convergence delay.
+
+When the link recovers:
+
+1. MRC periodically probes the withdrawn path.
+2. When a probe succeeds, the EV returns to GOOD and rejoins the active set.
+3. Again, no routing changes are needed.
+
+Why give up in-network recovery — the feature SR networks are usually praised for? Because two adaptive systems fighting over the same traffic behave worse than one. If dynamic routing were enabled, MRC would steer away from a failing path, then routing would reconverge and silently remap that path onto different links, disturbing MRC's carefully balanced spray. The same hash inputs would produce different outputs, and MRC's per-EV health tracking would be invalidated by changes it cannot see. Static routes reduce the system to a single adaptive layer — at the endpoints — where MRC already has the loss signals needed to make good decisions.
+
+This approach only works *because* SRv6 makes the path fully sender-determined. A switch never needs to know which paths are healthy — it just executes the uSID instructions it is handed. Path health is entirely the sender's concern, and the sender has all the information it needs: per-EV SACKs, NACKs, and RTT measurements.
+
+The result is excellent **observability**: since each EV maps deterministically to one physical path, an EV reported as bad identifies the exact failed link or switch — something the opaque ECMP hash cannot do. And because the tables are static and the path is fully determined by the sender, there is no routing convergence delay, no hash ambiguity, and no switch-level path computation.
+
 
 ### Comparing the Three Modes
 
@@ -719,9 +816,9 @@ Proxy mode is used by the following NICs:
 
 On the switch side, MRC has been validated on multiple platforms:
 
-- **NVIDIA Spectrum-4 and Spectrum-5**: 51.2 Tb/s ASICs that support standard ECMP, Structured EV forwarding via ACLs, and SRv6 uSID forwarding with static tables. Both Cumulus and SONiC are supported as the network operating system, providing configuration and management interfaces for routing, traffic classes, ECN marking thresholds, and trimming behavior.
+- **NVIDIA Spectrum-4 and Spectrum-5**: 51.2 Tb/s ASICs that support standard ECMP, Structured EV forwarding via ACLs, and SRv6 uSID forwarding with static tables. Two network operating systems are supported: **Cumulus Linux** (NVIDIA's own switch OS) and **SONiC** (Software for Open Networking in the Cloud, an open-source switch OS originally developed by Microsoft). Both provide configuration and management interfaces for routing, traffic classes, ECN marking thresholds, and trimming behavior.
 
-- **Broadcom Tomahawk 5**: Used in conjunction with Arista EOS for SRv6 forwarding.
+- **Broadcom Tomahawk 5**: Used in conjunction with **Arista EOS** (Extensible Operating System, Arista's network operating system) for SRv6 forwarding.
 
 
 ## Performance Evaluation
